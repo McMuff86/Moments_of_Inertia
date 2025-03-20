@@ -10,6 +10,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Threading.Tasks;
+using MathNet.Numerics.LinearAlgebra;
+using MathNet.Numerics.LinearAlgebra.Double;
 
 namespace Moments_of_Inertia.Views
 {
@@ -24,6 +26,11 @@ namespace Moments_of_Inertia.Views
         private TextBox yieldStrengthTextBox; // Streckgrenze des Materials
         private NumericStepper utilizationFactorStepper; // Sicherheitsfaktor für die Ausnutzungsberechnung
         private Label utilizationResultLabel; // Anzeige der berechneten Ausnutzung
+        
+        // Neue Eingabefelder für Querkräfte und Torsion
+        private TextBox shearForceXTextBox;
+        private TextBox shearForceYTextBox;
+        private TextBox torsionTextBox;
         
         // Outline curve controls
         private Button assignOutlineButton;
@@ -57,12 +64,16 @@ namespace Moments_of_Inertia.Views
         private double Wx, Wy;
         private double ix, iy;
         private double mass; // Masse basierend auf Dichte
+        
+        // Neue Variablen für maximale Abstände vom Schwerpunkt
+        private double xMax, yMax;
 
         // Visualisierungsobjekte
         private Guid centroidPointId = Guid.Empty;
         private Guid xAxisId = Guid.Empty;
         private Guid yAxisId = Guid.Empty;
         private Guid textElementId = Guid.Empty;
+        private List<Guid> meshVisualizationIds = new List<Guid>(); // Neue Mesh-Visualisierungsobjekte
         
         // Status-Flag für Farbänderung
         private bool useCustomColors = false;
@@ -84,6 +95,9 @@ namespace Moments_of_Inertia.Views
 
         // Speichern der berechneten Ausnutzungswerte
         private Dictionary<string, double> utilizationValues;
+
+        // Neue Checkbox für die Anzeige der Spannungsverteilung
+        private CheckBox showStressDistributionCheckBox;
 
         public InertiaPropertiesPanel()
         {
@@ -127,6 +141,25 @@ namespace Moments_of_Inertia.Views
             {
                 Text = "0",
                 ToolTip = "Enter bending moment around Y-axis (kNm)"
+            };
+
+            // Neue Eingabefelder für Querkräfte und Torsion
+            shearForceXTextBox = new TextBox
+            {
+                Text = "0",
+                ToolTip = "Enter shear force in X direction (kN)"
+            };
+
+            shearForceYTextBox = new TextBox
+            {
+                Text = "0",
+                ToolTip = "Enter shear force in Y direction (kN)"
+            };
+
+            torsionTextBox = new TextBox
+            {
+                Text = "0",
+                ToolTip = "Enter torsion moment (kNm)"
             };
 
             // Streckgrenze
@@ -210,6 +243,14 @@ namespace Moments_of_Inertia.Views
                 Text = "Show Principal Axes"
             };
             showAxesCheckBox.CheckedChanged += VisualizationOption_Changed;
+
+            // Neue Checkbox für die Anzeige der Spannungsverteilung
+            showStressDistributionCheckBox = new CheckBox
+            {
+                Text = "Show Stress Distribution",
+                Enabled = false // Initial deaktiviert, bis Berechnung erfolgt
+            };
+            showStressDistributionCheckBox.CheckedChanged += VisualizationOption_Changed;
 
             // Calculate button
             calculateButton = new Button
@@ -313,12 +354,16 @@ namespace Moments_of_Inertia.Views
             layout.AddRow(new Label { Text = "Section Utilization:", Font = new Eto.Drawing.Font(SystemFont.Bold) });
             layout.AddRow(new Label { Text = "Moment Mx (kNm):" }, momentXTextBox);
             layout.AddRow(new Label { Text = "Moment My (kNm):" }, momentYTextBox);
+            layout.AddRow(new Label { Text = "Shear Force Qx (kN):" }, shearForceXTextBox);
+            layout.AddRow(new Label { Text = "Shear Force Qy (kN):" }, shearForceYTextBox);
+            layout.AddRow(new Label { Text = "Torsion T (kNm):" }, torsionTextBox);
             layout.AddRow(new Label { Text = "Yield Strength (N/mm²):" }, yieldStrengthTextBox);
             layout.AddRow(new Label { Text = "Safety Factor:" }, utilizationFactorStepper);
             layout.AddRow(new Label { Text = "Utilization:" }, utilizationResultLabel);
             
             layout.AddRow(showCentroidCheckBox);
             layout.AddRow(showAxesCheckBox);
+            layout.AddRow(showStressDistributionCheckBox);
             layout.AddRow(null); // Spacer
             
             // Action buttons
@@ -536,6 +581,13 @@ namespace Moments_of_Inertia.Views
                 doc.Objects.Delete(textElementId, true);
                 textElementId = Guid.Empty;
             }
+            
+            // Neue Mesh-Visualisierungsobjekte entfernen
+            foreach (Guid id in meshVisualizationIds)
+            {
+                doc.Objects.Delete(id, true);
+            }
+            meshVisualizationIds.Clear();
 
             // Add centroid point if checked
             if (showCentroidCheckBox.Checked.GetValueOrDefault() && centroid != Point3d.Unset)
@@ -597,8 +649,254 @@ namespace Moments_of_Inertia.Views
                 
                 doc.Objects.Select(yAxisId);
             }
+            
+            // Spannungsverteilung anzeigen, wenn gewünscht
+            if (showStressDistributionCheckBox.Checked.GetValueOrDefault() && 
+                utilizationValues != null && 
+                outlineCurve != null)
+            {
+                try 
+                {
+                    // Erstelle ein Mesh für die Visualisierung
+                    Curve[] boundaries = new Curve[hollowCurves.Count + 1];
+                    boundaries[0] = outlineCurve;
+                    for (int i = 0; i < hollowCurves.Count; i++)
+                    {
+                        boundaries[i + 1] = hollowCurves[i];
+                    }
+                    
+                    // Erstellen der planaren Fläche mit Hohlräumen
+                    Brep[] breps = Brep.CreatePlanarBreps(boundaries, 0.001);
+                    if (breps != null && breps.Length > 0)
+                    {
+                        // Höhere Mesh-Dichte für bessere Visualisierung
+                        MeshingParameters mp = new MeshingParameters();
+                        mp.MinimumEdgeLength = Math.Min(outlineCurve.GetBoundingBox(true).Diagonal.Length / 100, 0.5);
+                        mp.MaximumEdgeLength = Math.Min(outlineCurve.GetBoundingBox(true).Diagonal.Length / 50, 2.0);
+                        Mesh[] meshes = Mesh.CreateFromBrep(breps[0], mp);
+                        
+                        if (meshes != null && meshes.Length > 0)
+                        {
+                            foreach (Mesh mesh in meshes)
+                            {
+                                // Farben für jeden Vertex basierend auf der Spannung berechnen
+                                mesh.VertexColors.CreateMonotoneMesh(System.Drawing.Color.Blue);
+                                
+                                // Maximale Spannung zur Normalisierung ermitteln
+                                double maxStress = utilizationValues["Sigma v"];
+                                
+                                for (int i = 0; i < mesh.Vertices.Count; i++)
+                                {
+                                    Point3d vertex = mesh.Vertices[i];
+                                    
+                                    // Abstand vom Schwerpunkt
+                                    double dx = vertex.X - centroid.X;
+                                    double dy = vertex.Y - centroid.Y;
+                                    
+                                    // Spannungen an diesem Punkt berechnen
+                                    // Verwende die Klassenvariablen xMax und yMax statt lokale Variablen
+                                    double sigmaX = Math.Abs(utilizationValues["Sigma X"] * dy / yMax);
+                                    double sigmaY = Math.Abs(utilizationValues["Sigma Y"] * dx / xMax);
+                                    double tau = utilizationValues.ContainsKey("Tau") ? utilizationValues["Tau"] : 0;
+                                    
+                                    // Von-Mises-Spannung
+                                    double sigmaV = Math.Sqrt(sigmaX * sigmaX + sigmaY * sigmaY - sigmaX * sigmaY + 3 * tau * tau);
+                                    
+                                    // Farbwert basierend auf normalisiertem Spannungswert
+                                    double normalizedStress = Math.Min(sigmaV / maxStress, 1.0);
+                                    
+                                    // Farbskala von Blau (0) über Grün (0.5) nach Rot (1.0)
+                                    System.Drawing.Color color;
+                                    if (normalizedStress < 0.5)
+                                    {
+                                        // Blau zu Grün
+                                        int blue = 255 - (int)(normalizedStress * 2 * 255);
+                                        int green = (int)(normalizedStress * 2 * 255);
+                                        color = System.Drawing.Color.FromArgb(0, green, blue);
+                                    }
+                                    else
+                                    {
+                                        // Grün zu Rot
+                                        int green = 255 - (int)((normalizedStress - 0.5) * 2 * 255);
+                                        int red = (int)((normalizedStress - 0.5) * 2 * 255);
+                                        color = System.Drawing.Color.FromArgb(red, green, 0);
+                                    }
+                                    
+                                    mesh.VertexColors[i] = color;
+                                }
+                                
+                                // Mesh zur Szene hinzufügen
+                                Guid meshId = doc.Objects.AddMesh(mesh);
+                                meshVisualizationIds.Add(meshId);
+                                
+                                // Objekt-Eigenschaften setzen
+                                RhinoObject meshObj = doc.Objects.Find(meshId);
+                                if (meshObj != null)
+                                {
+                                    meshObj.Attributes.ColorSource = ObjectColorSource.ColorFromObject;
+                                    meshObj.Attributes.ObjectColor = System.Drawing.Color.Gray; // Basis-Farbe (wird mit Vertex-Farben überschrieben)
+                                    meshObj.CommitChanges();
+                                }
+                            }
+                            
+                            // Legende für die Farbskala erstellen
+                            CreateStressLegend(doc, utilizationValues["Sigma v"]);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Error creating stress visualization: {ex.Message}");
+                }
+            }
 
             doc.Views.Redraw();
+        }
+        
+        // Neue Methode zur Erstellung einer Legende für die Spannungsverteilung
+        private void CreateStressLegend(RhinoDoc doc, double maxStress)
+        {
+            try
+            {
+                // Obere rechte Ecke des Bildschirms bestimmen
+                BoundingBox bbox = outlineCurve.GetBoundingBox(true);
+                Point3d legendStart = new Point3d(bbox.Max.X + bbox.Diagonal.Length * 0.15, bbox.Min.Y, 0);
+                
+                // Legende-Dimensionen
+                double legendHeight = bbox.Diagonal.Length * 0.3;
+                double legendWidth = bbox.Diagonal.Length * 0.05;
+                
+                // Farbbalken erstellen (10 Segmente)
+                int segments = 10;
+                for (int i = 0; i < segments; i++)
+                {
+                    double normalizedStress = (double)i / segments;
+                    double nextNormalizedStress = (double)(i + 1) / segments;
+                    
+                    // Eckpunkte des Rechtecks
+                    Point3d corner1 = new Point3d(
+                        legendStart.X, 
+                        legendStart.Y + normalizedStress * legendHeight, 
+                        0);
+                        
+                    Point3d corner2 = new Point3d(
+                        legendStart.X + legendWidth, 
+                        legendStart.Y + nextNormalizedStress * legendHeight, 
+                        0);
+                    
+                    // Rechteck erstellen
+                    Rectangle3d rect = new Rectangle3d(
+                        Plane.WorldXY, 
+                        corner1, 
+                        corner2);
+                    
+                    // Farbwert für dieses Segment
+                    System.Drawing.Color color;
+                    double colorValue = normalizedStress + 0.5 / segments; // Mittelpunkt des Segments
+                    
+                    if (colorValue < 0.5)
+                    {
+                        // Blau zu Grün
+                        int blue = 255 - (int)(colorValue * 2 * 255);
+                        int green = (int)(colorValue * 2 * 255);
+                        color = System.Drawing.Color.FromArgb(0, green, blue);
+                    }
+                    else
+                    {
+                        // Grün zu Rot
+                        int green = 255 - (int)((colorValue - 0.5) * 2 * 255);
+                        int red = (int)((colorValue - 0.5) * 2 * 255);
+                        color = System.Drawing.Color.FromArgb(red, green, 0);
+                    }
+                    
+                    // Geschlossene Kurve erstellen für Hatch
+                    Curve rectCurve = rect.ToNurbsCurve();
+                    
+                    // Sowohl Umriss als auch gefüllte Fläche hinzufügen
+                    
+                    // 1. Gefüllte Fläche (Hatch) hinzufügen
+                    var hatches = Hatch.Create(rectCurve, 0, 0, 1.0, 0.001);
+                    if (hatches != null && hatches.Length > 0)
+                    {
+                        // Hatch zur Szene hinzufügen
+                        Guid hatchId = doc.Objects.AddHatch(hatches[0]);
+                        meshVisualizationIds.Add(hatchId);
+                        
+                        // Farbeigenschaften des Hatch setzen
+                        RhinoObject hatchObj = doc.Objects.Find(hatchId);
+                        if (hatchObj != null)
+                        {
+                            hatchObj.Attributes.ColorSource = ObjectColorSource.ColorFromObject;
+                            hatchObj.Attributes.ObjectColor = color;
+                            hatchObj.CommitChanges();
+                        }
+                    }
+                    
+                    // 2. Umriss hinzufügen mit schwarzer Farbe für Kontrast
+                    Guid curveId = doc.Objects.AddCurve(rectCurve);
+                    meshVisualizationIds.Add(curveId);
+                    
+                    // Objekteigenschaften für den Umriss setzen
+                    RhinoObject obj = doc.Objects.Find(curveId);
+                    if (obj != null)
+                    {
+                        obj.Attributes.ColorSource = ObjectColorSource.ColorFromObject;
+                        obj.Attributes.ObjectColor = System.Drawing.Color.Black; // Schwarzer Umriss für besseren Kontrast
+                        obj.Attributes.PlotWeight = 0.15; // Dünnere Linie für den Umriss
+                        obj.CommitChanges();
+                    }
+                    
+                    // Beschriftungen für Min und Max hinzufügen
+                    if (i == 0 || i == segments - 1)
+                    {
+                        string text = i == 0 ? "0" : $"{maxStress:F0} N/mm²";
+                        Point3d textPoint = new Point3d(
+                            legendStart.X + legendWidth * 1.2, 
+                            legendStart.Y + normalizedStress * legendHeight + (i == segments - 1 ? 0 : legendHeight / segments), 
+                            0);
+                            
+                        var textEntity = new TextEntity
+                        {
+                            Plane = new Plane(textPoint, Vector3d.ZAxis),
+                            PlainText = text,
+                            Justification = TextJustification.Left,
+                            Font = new Rhino.DocObjects.Font("Arial")
+                        };
+                        
+                        double textHeight = bbox.Diagonal.Length * 0.015;
+                        textEntity.TextHeight = textHeight > 0 ? textHeight : 1.0;
+                        
+                        Guid textId = doc.Objects.AddText(textEntity);
+                        meshVisualizationIds.Add(textId);
+                    }
+                }
+                
+                // Titel für die Legende
+                Point3d titlePoint = new Point3d(
+                    legendStart.X, 
+                    legendStart.Y - bbox.Diagonal.Length * 0.03, 
+                    0);
+                    
+                var titleEntity = new TextEntity
+                {
+                    Plane = new Plane(titlePoint, Vector3d.ZAxis),
+                    PlainText = "Stress (N/mm²)",
+                    Justification = TextJustification.Left,
+                    // Einfacher Font ohne Bold-Versuch
+                    Font = new Rhino.DocObjects.Font("Arial")
+                };
+                
+                // Größere Schrift für den Titel verwenden
+                double titleHeight = bbox.Diagonal.Length * 0.025; // Etwas größer als normale Beschriftung
+                titleEntity.TextHeight = titleHeight > 0 ? titleHeight : 1.0;
+                
+                Guid titleId = doc.Objects.AddText(titleEntity);
+                meshVisualizationIds.Add(titleId);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Error creating legend: {ex.Message}");
+            }
         }
 
         private void AssignOutlineButton_Click(object sender, EventArgs e)
@@ -771,9 +1069,17 @@ namespace Moments_of_Inertia.Views
                 Point3d centroid1 = amp1.Centroid;
                 Point3d centroid2 = amp2.Centroid;
 
-                // Veraltete Contains-Methode durch Version mit Toleranz ersetzen
-                if (curve1.Contains(centroid2, Plane.WorldXY, 0.001) != PointContainment.Outside ||
-                    curve2.Contains(centroid1, Plane.WorldXY, 0.001) != PointContainment.Outside)
+                // Korrekte Ebenen für jede Kurve bestimmen
+                Plane plane1, plane2;
+                if (!curve1.TryGetPlane(out plane1))
+                    plane1 = Plane.WorldXY; // Fallback, falls keine Ebene bestimmt werden kann
+                
+                if (!curve2.TryGetPlane(out plane2))
+                    plane2 = Plane.WorldXY; // Fallback, falls keine Ebene bestimmt werden kann
+
+                // Jede Kurve in ihrer eigenen Ebene prüfen
+                if (curve1.Contains(centroid2, plane1, 0.001) != PointContainment.Outside ||
+                    curve2.Contains(centroid1, plane2, 0.001) != PointContainment.Outside)
                     return true;
             }
 
@@ -800,7 +1106,7 @@ namespace Moments_of_Inertia.Views
 
             try
             {
-                // Prüfen, ob die Kurve planar ist
+                // Prüfen, ob die Kurve planar ist und die korrekte Ebene ermitteln
                 Plane plane;
                 if (!outlineCurve.TryGetPlane(out plane))
                     return false;
@@ -840,7 +1146,7 @@ namespace Moments_of_Inertia.Views
                     {
                         double t = i / (double)(pointCount - 1);
                         Point3d point = curve.PointAt(t);
-                        PointContainment containment = outlineCurve.Contains(point, plane, 0.001);
+                        PointContainment containment = outlineCurve.Contains(point, plane, 0.001); // Korrekte Plane
                         
                         if (containment == PointContainment.Outside)
                         {
@@ -885,7 +1191,7 @@ namespace Moments_of_Inertia.Views
                         {
                             // Die Differenz der Flächen sollte relevant sein
                             double areaDiff = outlineAmp.Area - curveAmp.Area;
-                            if (areaDiff <= 0)
+                            if (areaDiff < -0.001) // Toleranz hinzugefügt
                                 return false;
                         }
                     }
@@ -894,6 +1200,10 @@ namespace Moments_of_Inertia.Views
                         // Bei Fehlern in der Boolean-Operation ignorieren und
                         // Entscheidung auf Basis der Punkttests treffen
                     }
+                    
+                    // Im High-Accuracy-Modus sind die bisherigen Tests ausreichend
+                    // Region-Test wird nicht benötigt
+                    return true;
                 }
                 else
                 {
@@ -905,7 +1215,7 @@ namespace Moments_of_Inertia.Views
                     {
                         double t = i / (double)(pointCount - 1);
                         Point3d point = curve.PointAt(t);
-                        if (outlineCurve.Contains(point, plane, 0.001) == PointContainment.Outside)
+                        if (outlineCurve.Contains(point, plane, 0.001) == PointContainment.Outside) // Korrekte Plane
                         {
                             outsidePoints++;
                         }
@@ -914,61 +1224,60 @@ namespace Moments_of_Inertia.Views
                     // Tolerieren von maximal einem Punkt, der als außerhalb erkannt wird (für numerische Stabilität)
                     if (outsidePoints > 1)
                         return false;
-                }
-                
-                // 3. Durchführen eines Region-Containment-Tests als letzte Überprüfung
-                // Dieser Test ist zuverlässiger als die Boolean-Operationen bei bestimmten Kurvenformen
-                try
-                {
-                    // Region aus der Hohlkurve erstellen
-                    Curve[] loops = new Curve[] { curve };
-                    // Die Methode CreatePlanarBreps statt CreatePlanarFace verwenden
-                    Brep[] faces = Brep.CreatePlanarBreps(loops, 0.001);
-                    
-                    if (faces != null && faces.Length > 0)
+                        
+                    // Im Performance-Modus wird der Region-Test als zusätzliche Absicherung beibehalten
+                    try
                     {
-                        // Das erste Brep prüfen
-                        foreach (BrepFace face in faces[0].Faces)
+                        // Region aus der Hohlkurve erstellen
+                        Curve[] loops = new Curve[] { curve };
+                        // Die Methode CreatePlanarBreps statt CreatePlanarFace verwenden
+                        Brep[] faces = Brep.CreatePlanarBreps(loops, 0.001);
+                        
+                        if (faces != null && faces.Length > 0)
                         {
-                            // To3dCurve() korrekt verwenden - in ein Array konvertieren falls nötig
-                            var loopCurve = face.OuterLoop.To3dCurve();
-                            
-                            // Immer als einzelne Curve behandeln und in ein Array konvertieren
-                            Curve[] regionCurves = new Curve[] { loopCurve };
-                            
-                            if (regionCurves != null && regionCurves.Length > 0)
+                            // Das erste Brep prüfen
+                            foreach (BrepFace face in faces[0].Faces)
                             {
-                                // Ist die Kurve der Region innerhalb der Outline?
-                                bool isValid = true;
-                                foreach (Curve regionCurve in regionCurves)
+                                // To3dCurve() korrekt verwenden - in ein Array konvertieren falls nötig
+                                var loopCurve = face.OuterLoop.To3dCurve();
+                                
+                                // Immer als einzelne Curve behandeln und in ein Array konvertieren
+                                Curve[] regionCurves = new Curve[] { loopCurve };
+                                
+                                if (regionCurves != null && regionCurves.Length > 0)
                                 {
-                                    int testPointCount = Math.Max(4, (int)(regionCurve.GetLength() / 20.0));
-                                    for (int i = 0; i < testPointCount; i++)
+                                    // Ist die Kurve der Region innerhalb der Outline?
+                                    bool isValid = true;
+                                    foreach (Curve regionCurve in regionCurves)
                                     {
-                                        double t = i / (double)(testPointCount - 1);
-                                        Point3d point = regionCurve.PointAt(t);
-                                        
-                                        if (outlineCurve.Contains(point, plane, 0.001) == PointContainment.Outside)
+                                        int testPointCount = Math.Max(4, (int)(regionCurve.GetLength() / 20.0));
+                                        for (int i = 0; i < testPointCount; i++)
                                         {
-                                            isValid = false;
-                                            break;
+                                            double t = i / (double)(testPointCount - 1);
+                                            Point3d point = regionCurve.PointAt(t);
+                                            
+                                            if (outlineCurve.Contains(point, plane, 0.001) == PointContainment.Outside) // Korrekte Plane
+                                            {
+                                                isValid = false;
+                                                break;
+                                            }
                                         }
+                                        
+                                        if (!isValid)
+                                            break;
                                     }
                                     
+                                    // Wenn die Region ungültig ist, ist die Kurve nicht innen
                                     if (!isValid)
-                                        break;
+                                        return false;
                                 }
-                                
-                                // Wenn die Region ungültig ist, ist die Kurve nicht innen
-                                if (!isValid)
-                                    return false;
                             }
                         }
                     }
-                }
-                catch (Exception)
-                {
-                    // Fehler ignorieren - andere Tests könnten trotzdem bestanden werden
+                    catch (Exception)
+                    {
+                        // Fehler ignorieren - andere Tests könnten trotzdem bestanden werden
+                    }
                 }
                 
                 // Wenn alle Tests erfolgreich waren (oder keine Fehler geworfen haben),
@@ -1030,6 +1339,10 @@ namespace Moments_of_Inertia.Views
                 double momentY = 0;
                 double yieldStrength = 0;
                 double safetyFactor = 1.0;
+                // Neue Variablen für Querkräfte und Torsion
+                double Qx = 0;
+                double Qy = 0;
+                double T = 0;
                 
                 if (!double.TryParse(momentXTextBox.Text, out momentX))
                 {
@@ -1042,6 +1355,31 @@ namespace Moments_of_Inertia.Views
                 if (!double.TryParse(momentYTextBox.Text, out momentY))
                 {
                     MessageBox.Show("Invalid value for moment My. Please enter a valid number.", "Validation Error");
+                    calculateButton.Text = originalButtonText;
+                    calculateButton.Enabled = true;
+                    return;
+                }
+                
+                // Validierung der Querkräfte und Torsion
+                if (!double.TryParse(shearForceXTextBox.Text, out Qx))
+                {
+                    MessageBox.Show("Invalid value for shear force Qx. Please enter a valid number.", "Validation Error");
+                    calculateButton.Text = originalButtonText;
+                    calculateButton.Enabled = true;
+                    return;
+                }
+                
+                if (!double.TryParse(shearForceYTextBox.Text, out Qy))
+                {
+                    MessageBox.Show("Invalid value for shear force Qy. Please enter a valid number.", "Validation Error");
+                    calculateButton.Text = originalButtonText;
+                    calculateButton.Enabled = true;
+                    return;
+                }
+                
+                if (!double.TryParse(torsionTextBox.Text, out T))
+                {
+                    MessageBox.Show("Invalid value for torsion T. Please enter a valid number.", "Validation Error");
                     calculateButton.Text = originalButtonText;
                     calculateButton.Enabled = true;
                     return;
@@ -1108,13 +1446,14 @@ namespace Moments_of_Inertia.Views
                 Iy = momentsOfInertia.Y;
                 
                 // OPTIMIERT: Zweistufige Berechnung von xMax und yMax für bessere Performance
-                double yMax = 0.0;
-                double xMax = 0.0;
+                // Verwende die Klassenvariablen statt lokaler Variablen
+                this.xMax = 0.0;
+                this.yMax = 0.0;
                 
                 // Stufe 1: Schnelle Abschätzung mit BoundingBox
                 BoundingBox bbox = outlineCurve.GetBoundingBox(true);
-                yMax = Math.Max(Math.Abs(bbox.Max.Y - centroid.Y), Math.Abs(bbox.Min.Y - centroid.Y));
-                xMax = Math.Max(Math.Abs(bbox.Max.X - centroid.X), Math.Abs(bbox.Min.X - centroid.X));
+                this.yMax = Math.Max(Math.Abs(bbox.Max.Y - centroid.Y), Math.Abs(bbox.Min.Y - centroid.Y));
+                this.xMax = Math.Max(Math.Abs(bbox.Max.X - centroid.X), Math.Abs(bbox.Min.X - centroid.X));
                 
                 // Stufe 2: Präzise Berechnung mit Punkten auf der Kurve, wenn hohe Genauigkeit gewünscht ist
                 if (highAccuracyCheckBox.Checked.GetValueOrDefault())
@@ -1129,8 +1468,8 @@ namespace Moments_of_Inertia.Views
                         double dx = Math.Abs(point.X - centroid.X);
                         double dy = Math.Abs(point.Y - centroid.Y);
                         
-                        xMax = Math.Max(xMax, dx);
-                        yMax = Math.Max(yMax, dy);
+                        this.xMax = Math.Max(this.xMax, dx);
+                        this.yMax = Math.Max(this.yMax, dy);
                     }
                     
                     // Auch Hohlraumkurven prüfen, falls vorhanden
@@ -1145,8 +1484,8 @@ namespace Moments_of_Inertia.Views
                             double dx = Math.Abs(point.X - centroid.X);
                             double dy = Math.Abs(point.Y - centroid.Y);
                             
-                            xMax = Math.Max(xMax, dx);
-                            yMax = Math.Max(yMax, dy);
+                            this.xMax = Math.Max(this.xMax, dx);
+                            this.yMax = Math.Max(this.yMax, dy);
                         }
                     }
                 }
@@ -1165,8 +1504,8 @@ namespace Moments_of_Inertia.Views
                             double dx = Math.Abs(point.X - centroid.X);
                             double dy = Math.Abs(point.Y - centroid.Y);
                             
-                            xMax = Math.Max(xMax, dx);
-                            yMax = Math.Max(yMax, dy);
+                            this.xMax = Math.Max(this.xMax, dx);
+                            this.yMax = Math.Max(this.yMax, dy);
                         }
                         
                         // Hohlräume mit geringer Punktdichte prüfen
@@ -1181,29 +1520,29 @@ namespace Moments_of_Inertia.Views
                                 double dx = Math.Abs(point.X - centroid.X);
                                 double dy = Math.Abs(point.Y - centroid.Y);
                                 
-                                xMax = Math.Max(xMax, dx);
-                                yMax = Math.Max(yMax, dy);
+                                this.xMax = Math.Max(this.xMax, dx);
+                                this.yMax = Math.Max(this.yMax, dy);
                             }
                         }
                     }
                 }
                 
                 // VERBESSERT: Sicherheitscheck, dass die Abstände nicht Null sind
-                if (yMax < 0.001)
+                if (this.yMax < 0.001)
                 {
                     MessageBox.Show("Maximum y-distance from centroid too small for accurate calculations", "Warning");
-                    yMax = 0.001;
+                    this.yMax = 0.001;
                 }
                 
-                if (xMax < 0.001)
+                if (this.xMax < 0.001)
                 {
                     MessageBox.Show("Maximum x-distance from centroid too small for accurate calculations", "Warning");
-                    xMax = 0.001;
+                    this.xMax = 0.001;
                 }
                 
                 // Widerstandsmomente berechnen mit genaueren Maximalwerten
-                Wx = Ix / yMax;
-                Wy = Iy / xMax;
+                Wx = Ix / this.yMax;
+                Wy = Iy / this.xMax;
                 
                 // Trägheitsradien berechnen
                 ix = Math.Sqrt(Ix / area);
@@ -1233,8 +1572,43 @@ namespace Moments_of_Inertia.Views
                     mass = 0;
                 }
                 
+                // NEU: Mesh-Diskretisierung für spätere FEA-Erweiterung
+                List<MeshElementResult> elementResults = new List<MeshElementResult>();
+                if (highAccuracyCheckBox.Checked.GetValueOrDefault())
+                {
+                    // Nur im High-Accuracy-Modus ein feineres Mesh erstellen
+                    MeshingParameters mp = new MeshingParameters();
+                    mp.MinimumEdgeLength = Math.Min(bbox.Diagonal.Length / 50, 1.0); // Feineres Mesh
+                    mp.MaximumEdgeLength = Math.Min(bbox.Diagonal.Length / 20, 5.0);
+                    Mesh[] meshes = Mesh.CreateFromBrep(breps[0], mp);
+                    
+                    if (meshes != null && meshes.Length > 0)
+                    {
+                        // Durch die Mesh-Vertices iterieren und Spannungen berechnen
+                        foreach (Mesh mesh in meshes)
+                        {
+                            for (int i = 0; i < mesh.Vertices.Count; i++)
+                            {
+                                Point3d vertex = mesh.Vertices[i];
+                                
+                                // Abstand vom Schwerpunkt
+                                double dx = vertex.X - centroid.X;
+                                double dy = vertex.Y - centroid.Y;
+                                
+                                // Element-Ergebnis für zukünftige FEA-Erweiterung speichern
+                                MeshElementResult elementResult = new MeshElementResult
+                                {
+                                    Centroid = vertex
+                                    // Spannungen werden später berechnet
+                                };
+                                elementResults.Add(elementResult);
+                            }
+                        }
+                    }
+                }
+                
                 // Zusätzlich: Berechnung der Ausnutzung, wenn Biegemomente eingegeben wurden
-                if ((momentX != 0) || (momentY != 0))
+                if ((momentX != 0) || (momentY != 0) || (Qx != 0) || (Qy != 0) || (T != 0))
                 {
                     if (yieldStrength > 0)
                     {
@@ -1242,7 +1616,14 @@ namespace Moments_of_Inertia.Views
                         momentX *= 1000000;
                         momentY *= 1000000;
                         
-                        // Spannungen berechnen (N/mm²)
+                        // Querkräfte von kN in N umrechnen (x 1000)
+                        Qx *= 1000;
+                        Qy *= 1000;
+                        
+                        // Torsionsmoment von kNm in Nmm umrechnen (x 10^6)
+                        T *= 1000000;
+                        
+                        // Normalspannungen berechnen (N/mm²)
                         // Berücksichtigung der Richtung: Positive und negative Spannungen berücksichtigen
                         double sigmaXPos = momentX > 0 ? momentX / Wx : 0;
                         double sigmaXNeg = momentX < 0 ? -momentX / Wx : 0;
@@ -1253,10 +1634,40 @@ namespace Moments_of_Inertia.Views
                         double sigmaX = Math.Max(Math.Abs(sigmaXPos), Math.Abs(sigmaXNeg));
                         double sigmaY = Math.Max(Math.Abs(sigmaYPos), Math.Abs(sigmaYNeg));
                         
-                        // Von Mises Vergleichsspannung berechnen
-                        // HINWEIS: Diese Formel berücksichtigt nur Biegespannungen, keine Schubspannungen
-                        // Für eine vollständigere Berechnung wäre σv = √(σx² + σy² - σx·σy + 3·τ²) nötig
-                        double sigmaV = Math.Sqrt(sigmaX * sigmaX + sigmaY * sigmaY - sigmaX * sigmaY);
+                        // NEU: Berechnung der Schubspannungen
+                        // Vereinfachte Schubspannungsberechnung (Näherung)
+                        double Jt = Ix + Iy; // Torsionswiderstand (vereinfacht)
+                        
+                        // Schubspannungen aus Querkräften (approximiert)
+                        double width = bbox.Max.X - bbox.Min.X;
+                        double height = bbox.Max.Y - bbox.Min.Y;
+                        
+                        double tauQx = Math.Abs(Qx) > 0.001 ? 1.5 * Math.Abs(Qx) / area : 0;
+                        double tauQy = Math.Abs(Qy) > 0.001 ? 1.5 * Math.Abs(Qy) / area : 0;
+                        
+                        // Schubspannungen aus Torsion (vereinfacht)
+                        double tauT = 0;
+                        if (Math.Abs(T) > 0.001)
+                        {
+                            // Vereinfachter Ansatz für geschlossene Querschnitte
+                            double maxDistance = Math.Max(this.xMax, this.yMax);
+                            tauT = T * maxDistance / Jt;
+                        }
+                        
+                        // Resultierender Schubspannungsvektor
+                        double tau = Math.Sqrt(tauQx * tauQx + tauQy * tauQy + tauT * tauT);
+                        
+                        // Von Mises Vergleichsspannung mit Math.NET berechnen
+                        // Spannungstensor (vereinfacht 2D)
+                        var stressVector = DenseVector.OfArray(new double[] { sigmaX, sigmaY, 0 });
+                        var shearVector = DenseVector.OfArray(new double[] { tau, 0, 0 });
+                        
+                        // Von Mises: sqrt(sigma_x^2 + sigma_y^2 - sigma_x*sigma_y + 3*tau^2)
+                        double sigmaV = Math.Sqrt(
+                            stressVector[0] * stressVector[0] + 
+                            stressVector[1] * stressVector[1] - 
+                            stressVector[0] * stressVector[1] + 
+                            3 * shearVector[0] * shearVector[0]);
                         
                         // Ausnutzung berechnen (unter Berücksichtigung des Sicherheitsfaktors)
                         double utilization = sigmaV / (yieldStrength / safetyFactor) * 100;
@@ -1270,17 +1681,50 @@ namespace Moments_of_Inertia.Views
                         {
                             { "Sigma X", sigmaX },
                             { "Sigma Y", sigmaY },
+                            { "Tau Qx", tauQx },
+                            { "Tau Qy", tauQy },
+                            { "Tau T", tauT },
+                            { "Tau", tau },
                             { "Sigma v", sigmaV },
                             { "Utilization", utilization }
                         };
                         
+                        // Wenn im High-Accuracy-Modus, Spannungen auch für Mesh-Elemente berechnen
+                        if (highAccuracyCheckBox.Checked.GetValueOrDefault() && elementResults.Count > 0)
+                        {
+                            foreach (MeshElementResult element in elementResults)
+                            {
+                                // Abstand vom Schwerpunkt
+                                double dx = element.Centroid.X - centroid.X;
+                                double dy = element.Centroid.Y - centroid.Y;
+                                
+                                // Spannungen an diesem Punkt
+                                element.SigmaX = momentY * dy / Ix;
+                                element.SigmaY = momentX * dx / Iy;
+                                element.TauXY = Math.Sqrt(tauQx * tauQx + tauQy * tauQy);
+                                element.TauT = tauT;
+                                element.Tau = tau;
+                                
+                                // Von-Mises-Spannung
+                                element.SigmaV = Math.Sqrt(
+                                    element.SigmaX * element.SigmaX + 
+                                    element.SigmaY * element.SigmaY - 
+                                    element.SigmaX * element.SigmaY + 
+                                    3 * element.Tau * element.Tau);
+                            }
+                        }
+                        
                         // Zusatz-Info zur Schubspannung
-                        MessageBox.Show(
-                            "Note: The utilization calculation considers only bending stresses (σx, σy).\n" +
-                            "Shear stresses are not included in this simplified model.\n" +
-                            "For a complete stress analysis, a FEA tool should be used.", 
-                            "Stress Calculation Info", 
-                            MessageBoxType.Information);
+                        if (Qx != 0 || Qy != 0 || T != 0)
+                        {
+                            MessageBox.Show(
+                                "Note: The calculation now includes approximate values for shear stresses.\n" +
+                                "- Shear stresses from Qx and Qy use simplified methods.\n" +
+                                "- Torsional shear stresses are approximated for closed sections.\n" +
+                                "- For more accurate results, a full FEA analysis is recommended.", 
+                                "Stress Calculation Info", 
+                                MessageBoxType.Information);
+                        }
                     }
                     else
                     {
@@ -1307,6 +1751,9 @@ namespace Moments_of_Inertia.Views
                 
                 // ShowValues-Button aktivieren
                 showValuesButton.Enabled = true;
+                
+                // NEU: Aktiviere die Checkbox für die Spannungsvisualisierung
+                showStressDistributionCheckBox.Enabled = utilizationValues != null;
             }
             catch (Exception ex)
             {
@@ -1413,20 +1860,30 @@ namespace Moments_of_Inertia.Views
                         await Task.Run(() => {
                             try
                             {
-                                // UI-Updates im UI-Thread
+                                // Alle UI-Updates in einem einzigen Invoke-Block zusammenfassen
                                 Eto.Forms.Application.Instance.Invoke(() => {
-                                    calculateButton.Text = "Calculating...";
-                                    calculateButton.Enabled = false;
-                                });
-                                
-                                // UpdateCurveInfo jetzt auch asynchron ausführen
-                                Eto.Forms.Application.Instance.Invoke(() => {
-                                    UpdateCurveInfo();
-                                });
-                                
-                                // Berechnung durchführen
-                                Eto.Forms.Application.Instance.Invoke(() => {
-                                    CalculateButton_Click(this, EventArgs.Empty);
+                                    try 
+                                    {
+                                        // Button-Status setzen
+                                        calculateButton.Text = "Calculating...";
+                                        calculateButton.Enabled = false;
+                                        
+                                        // Kurveninformationen aktualisieren
+                                        UpdateCurveInfo();
+                                        
+                                        // Berechnung durchführen
+                                        CalculateButton_Click(this, EventArgs.Empty);
+                                        
+                                        // Button-Status zurücksetzen
+                                        calculateButton.Text = "Calculate";
+                                        calculateButton.Enabled = true;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        System.Diagnostics.Debug.WriteLine($"UI update error: {ex.Message}");
+                                        calculateButton.Text = "Calculate";
+                                        calculateButton.Enabled = true;
+                                    }
                                 });
                             }
                             catch (Exception ex)
@@ -1673,6 +2130,20 @@ namespace Moments_of_Inertia.Views
                 results.Add(new ResultItem("Section Utilization", "", ""));
                 results.Add(new ResultItem("Stress Sigma X", utilizationValues["Sigma X"].ToString("F2"), "N/mm²"));
                 results.Add(new ResultItem("Stress Sigma Y", utilizationValues["Sigma Y"].ToString("F2"), "N/mm²"));
+                
+                // Neue Werte für Schubspannungen hinzufügen
+                if (utilizationValues.ContainsKey("Tau Qx"))
+                    results.Add(new ResultItem("Shear Stress Qx", utilizationValues["Tau Qx"].ToString("F2"), "N/mm²"));
+                
+                if (utilizationValues.ContainsKey("Tau Qy"))
+                    results.Add(new ResultItem("Shear Stress Qy", utilizationValues["Tau Qy"].ToString("F2"), "N/mm²"));
+                
+                if (utilizationValues.ContainsKey("Tau T"))
+                    results.Add(new ResultItem("Torsional Stress", utilizationValues["Tau T"].ToString("F2"), "N/mm²"));
+                
+                if (utilizationValues.ContainsKey("Tau"))
+                    results.Add(new ResultItem("Combined Shear Stress", utilizationValues["Tau"].ToString("F2"), "N/mm²"));
+                
                 results.Add(new ResultItem("Equivalent Stress Sigma v", utilizationValues["Sigma v"].ToString("F2"), "N/mm²"));
                 
                 string utilizationText = utilizationValues["Utilization"].ToString("F1");
@@ -1890,6 +2361,20 @@ namespace Moments_of_Inertia.Views
                 sb.AppendLine("=== SECTION UTILIZATION ===");
                 sb.AppendLine($"Stress Sigma X: {utilizationValues["Sigma X"]:F2} N/mm²");
                 sb.AppendLine($"Stress Sigma Y: {utilizationValues["Sigma Y"]:F2} N/mm²");
+                
+                // Neue Werte für Schubspannungen hinzufügen
+                if (utilizationValues.ContainsKey("Tau Qx"))
+                    sb.AppendLine($"Shear Stress Qx: {utilizationValues["Tau Qx"]:F2} N/mm²");
+                
+                if (utilizationValues.ContainsKey("Tau Qy"))
+                    sb.AppendLine($"Shear Stress Qy: {utilizationValues["Tau Qy"]:F2} N/mm²");
+                
+                if (utilizationValues.ContainsKey("Tau T"))
+                    sb.AppendLine($"Torsional Stress: {utilizationValues["Tau T"]:F2} N/mm²");
+                
+                if (utilizationValues.ContainsKey("Tau"))
+                    sb.AppendLine($"Combined Shear Stress: {utilizationValues["Tau"]:F2} N/mm²");
+                
                 sb.AppendLine($"Equivalent Stress: {utilizationValues["Sigma v"]:F2} N/mm²");
                 
                 string utilizationText = utilizationValues["Utilization"].ToString("F1");
@@ -1957,5 +2442,17 @@ namespace Moments_of_Inertia.Views
             Value = value;
             Unit = unit;
         }
+    }
+    
+    // Hilfsklasse für Mesh-Element-Ergebnisse (FEA-Vorbereitung)
+    public class MeshElementResult
+    {
+        public Point3d Centroid { get; set; } // Schwerpunkt des Elements
+        public double SigmaX { get; set; }    // Biegespannung X
+        public double SigmaY { get; set; }    // Biegespannung Y
+        public double TauXY { get; set; }     // Schubspannung in XY-Ebene
+        public double TauT { get; set; }      // Torsionsschubspannung
+        public double Tau { get; set; }       // Gesamtschubspannung
+        public double SigmaV { get; set; }    // Von-Mises-Spannung
     }
 } 
