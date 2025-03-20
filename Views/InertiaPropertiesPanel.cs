@@ -9,6 +9,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Threading.Tasks;
 
 namespace Moments_of_Inertia.Views
 {
@@ -17,6 +18,12 @@ namespace Moments_of_Inertia.Views
     {
         private DropDown materialDropdown;
         private TextBox densityTextBox;
+        private TextBox profileDepthTextBox;
+        private TextBox momentXTextBox; // Biegemoment um die X-Achse
+        private TextBox momentYTextBox; // Biegemoment um die Y-Achse
+        private TextBox yieldStrengthTextBox; // Streckgrenze des Materials
+        private NumericStepper utilizationFactorStepper; // Sicherheitsfaktor für die Ausnutzungsberechnung
+        private Label utilizationResultLabel; // Anzeige der berechneten Ausnutzung
         
         // Outline curve controls
         private Button assignOutlineButton;
@@ -29,6 +36,7 @@ namespace Moments_of_Inertia.Views
         private DropDown unitDropdown;
         private CheckBox showCentroidCheckBox;
         private CheckBox showAxesCheckBox;
+        private CheckBox highAccuracyCheckBox; // Neu: Option für hohe Genauigkeit
         private Button calculateButton;
         private CheckBox realtimeCheckBox;
         private Button exportButton;
@@ -60,18 +68,22 @@ namespace Moments_of_Inertia.Views
         private bool useCustomColors = false;
 
         // Material-Dichte-Dictionary
-        private Dictionary<string, double> materialDensities = new Dictionary<string, double>
+        private Dictionary<string, double[]> materialProperties = new Dictionary<string, double[]>
         {
-            { "Steel", 7.85 },     // g/cm³
-            { "Aluminum", 2.7 },   // g/cm³
-            { "Wood", 0.7 },       // g/cm³
-            { "Concrete", 2.4 },   // g/cm³
-            { "Glass", 2.5 },      // g/cm³
-            { "Custom", 1.0 }      // g/cm³
+            // Werte: [Dichte (g/cm³), Streckgrenze (N/mm²)]
+            { "Steel", new double[] { 7.85, 235.0 } },      // Baustahl S235
+            { "Aluminum", new double[] { 2.7, 160.0 } },   // Aluminium-Legierung
+            { "Wood", new double[] { 0.7, 20.0 } },        // Holz (durchschnittlich)
+            { "Concrete", new double[] { 2.4, 30.0 } },    // Beton (Druckfestigkeit)
+            { "Glass", new double[] { 2.5, 50.0 } },       // Glas
+            { "Custom", new double[] { 1.0, 100.0 } }      // Benutzerdefiniert
         };
 
         // Timer für regelmäßige Aktualisierungen
         private UITimer _updateTimer;
+
+        // Speichern der berechneten Ausnutzungswerte
+        private Dictionary<string, double> utilizationValues;
 
         public InertiaPropertiesPanel()
         {
@@ -82,7 +94,7 @@ namespace Moments_of_Inertia.Views
         {
             // Material selection
             materialDropdown = new DropDown();
-            foreach (var material in materialDensities.Keys)
+            foreach (var material in materialProperties.Keys)
             {
                 materialDropdown.Items.Add(material);
             }
@@ -92,8 +104,54 @@ namespace Moments_of_Inertia.Views
             // Density input
             densityTextBox = new TextBox
             {
-                Text = materialDensities["Steel"].ToString(),
+                Text = materialProperties["Steel"][0].ToString(),
                 ReadOnly = true
+            };
+
+            // Profile depth input
+            profileDepthTextBox = new TextBox
+            {
+                Text = "1000", // Default 1000 mm = 1 m
+                ToolTip = "Enter the profile depth for mass calculation (in mm)"
+            };
+
+            // Biegemoment Mx
+            momentXTextBox = new TextBox
+            {
+                Text = "0",
+                ToolTip = "Enter bending moment around X-axis (kNm)"
+            };
+
+            // Biegemoment My
+            momentYTextBox = new TextBox
+            {
+                Text = "0",
+                ToolTip = "Enter bending moment around Y-axis (kNm)"
+            };
+
+            // Streckgrenze
+            yieldStrengthTextBox = new TextBox
+            {
+                Text = materialProperties["Steel"][1].ToString(),
+                ToolTip = "Yield strength of the material (N/mm²)"
+            };
+
+            // Sicherheitsfaktor für die Ausnutzung
+            utilizationFactorStepper = new NumericStepper
+            {
+                Value = 1.0,
+                MinValue = 0.1,
+                MaxValue = 2.0,
+                Increment = 0.1,
+                DecimalPlaces = 1,
+                ToolTip = "Safety factor for utilization calculation"
+            };
+
+            // Ergebnis-Label für die Ausnutzung
+            utilizationResultLabel = new Label
+            {
+                Text = "-- %",
+                Font = new Eto.Drawing.Font(SystemFont.Bold)
             };
 
             // Outline curve controls with improved layout
@@ -129,9 +187,16 @@ namespace Moments_of_Inertia.Views
             // Units dropdown
             unitDropdown = new DropDown
             {
-                Items = { "mm", "cm" }
+                Items = { "mm", "cm", "m" } // Meter als Option hinzugefügt
             };
-            unitDropdown.SelectedIndex = 1; // Default to cm statt mm
+            unitDropdown.SelectedIndex = 1; // Default to cm
+
+            // High accuracy checkbox
+            highAccuracyCheckBox = new CheckBox
+            {
+                Text = "High Accuracy",
+                ToolTip = "Use more precise calculations (slower performance)"
+            };
 
             // Visualization options
             showCentroidCheckBox = new CheckBox
@@ -200,6 +265,7 @@ namespace Moments_of_Inertia.Views
             layout.AddRow(new Label { Text = "Material Properties:", Font = new Eto.Drawing.Font(SystemFont.Bold) });
             layout.AddRow(new Label { Text = "Material:" }, materialDropdown);
             layout.AddRow(new Label { Text = "Density (g/cm³):" }, densityTextBox);
+            layout.AddRow(new Label { Text = "Profile Depth (mm):" }, profileDepthTextBox);
             layout.AddRow(null); // Spacer
             
             // Curve selection section
@@ -241,6 +307,16 @@ namespace Moments_of_Inertia.Views
             // Options section
             layout.AddRow(new Label { Text = "Options:", Font = new Eto.Drawing.Font(SystemFont.Bold) });
             layout.AddRow(new Label { Text = "Units:" }, unitDropdown);
+            layout.AddRow(highAccuracyCheckBox);
+            
+            // Section Utilization section
+            layout.AddRow(new Label { Text = "Section Utilization:", Font = new Eto.Drawing.Font(SystemFont.Bold) });
+            layout.AddRow(new Label { Text = "Moment Mx (kNm):" }, momentXTextBox);
+            layout.AddRow(new Label { Text = "Moment My (kNm):" }, momentYTextBox);
+            layout.AddRow(new Label { Text = "Yield Strength (N/mm²):" }, yieldStrengthTextBox);
+            layout.AddRow(new Label { Text = "Safety Factor:" }, utilizationFactorStepper);
+            layout.AddRow(new Label { Text = "Utilization:" }, utilizationResultLabel);
+            
             layout.AddRow(showCentroidCheckBox);
             layout.AddRow(showAxesCheckBox);
             layout.AddRow(null); // Spacer
@@ -269,11 +345,15 @@ namespace Moments_of_Inertia.Views
             if (selectedMaterial == "Custom")
             {
                 densityTextBox.ReadOnly = false;
+                yieldStrengthTextBox.ReadOnly = false;
             }
             else
             {
                 densityTextBox.ReadOnly = true;
-                densityTextBox.Text = materialDensities[selectedMaterial].ToString();
+                densityTextBox.Text = materialProperties[selectedMaterial][0].ToString();
+                
+                yieldStrengthTextBox.ReadOnly = true;
+                yieldStrengthTextBox.Text = materialProperties[selectedMaterial][1].ToString();
             }
         }
 
@@ -357,7 +437,7 @@ namespace Moments_of_Inertia.Views
                 
                 // Einheiten für die Länge basierend auf ausgewählter Einheit hinzufügen
                 string unit = unitDropdown.SelectedKey;
-                double factor = unit == "mm" ? 1.0 : 0.1; // mm zu cm Umrechnung
+                double factor = unit == "mm" ? 1.0 : (unit == "cm" ? 0.1 : 0.001); // Korrigiert für m-Einheit
                 
                 outlineProperties.Add(new CurvePropertyItem("Length", $"{outlineCurve.GetLength() * factor:F2} {unit}"));
                 outlineProperties.Add(new CurvePropertyItem("Closed", outlineCurve.IsClosed.ToString()));
@@ -379,7 +459,7 @@ namespace Moments_of_Inertia.Views
                 
                 // Einheiten für die Länge basierend auf ausgewählter Einheit hinzufügen
                 string unit = unitDropdown.SelectedKey;
-                double factor = unit == "mm" ? 1.0 : 0.1; // mm zu cm Umrechnung
+                double factor = unit == "mm" ? 1.0 : (unit == "cm" ? 0.1 : 0.001); // Korrigiert für m-Einheit
                 
                 double totalLength = 0;
                 for (int i = 0; i < hollowCurves.Count; i++)
@@ -610,6 +690,10 @@ namespace Moments_of_Inertia.Views
             hollowCurves.Clear();
             hollowCurveRefs.Clear();
 
+            // Temporäre Liste zur Prüfung vor dem endgültigen Hinzufügen
+            List<Curve> tempHollowCurves = new List<Curve>();
+            List<ObjRef> tempHollowRefs = new List<ObjRef>();
+
             // Neue Hohlräume hinzufügen
             for (int i = 0; i < go.ObjectCount; i++)
             {
@@ -617,20 +701,40 @@ namespace Moments_of_Inertia.Views
                 Curve curve = objRef.Curve();
                 
                 if (curve == null || !curve.IsClosed || !curve.IsPlanar())
+                {
+                    MessageBox.Show($"Curve {i+1} is not a valid closed planar curve and will be ignored.", "Warning");
                     continue;
+                }
 
                 // Prüfen, ob die Hohlraumkurve innerhalb der Umrisskurve liegt
                 if (!IsInsideOutline(curve))
                 {
-                    MessageBox.Show("All hollow curves must be inside the outline", "Error");
-                    hollowCurves.Clear();
-                    hollowCurveRefs.Clear();
-                    return;
+                    MessageBox.Show($"Curve {i+1} is not completely inside the outline and will be ignored.", "Warning");
+                    continue;
                 }
 
-                hollowCurves.Add(curve.DuplicateCurve());
-                hollowCurveRefs.Add(objRef);
+                // Prüfen, ob sich die neue Kurve mit bereits ausgewählten Hohlraumkurven überschneidet
+                bool hasIntersection = false;
+                foreach (Curve existingCurve in tempHollowCurves)
+                {
+                    if (DoCurvesIntersect(curve, existingCurve))
+                    {
+                        MessageBox.Show($"Curve {i+1} intersects with another selected hollow curve and will be ignored.", "Warning");
+                        hasIntersection = true;
+                        break;
+                    }
+                }
+
+                if (!hasIntersection)
+                {
+                    tempHollowCurves.Add(curve.DuplicateCurve());
+                    tempHollowRefs.Add(objRef);
+                }
             }
+
+            // Alle gültigen Kurven zur endgültigen Liste hinzufügen
+            hollowCurves = tempHollowCurves;
+            hollowCurveRefs = tempHollowRefs;
             
             // Update curve info
             UpdateCurveInfo();
@@ -638,7 +742,42 @@ namespace Moments_of_Inertia.Views
             // Clear previous results
             ClearResults();
             
-            MessageBox.Show($"{hollowCurves.Count} hollow curve(s) assigned", "Success");
+            if (hollowCurves.Count > 0)
+            {
+                MessageBox.Show($"{hollowCurves.Count} valid hollow curve(s) assigned", "Success");
+            }
+            else
+            {
+                MessageBox.Show("No valid hollow curves were assigned. Please ensure curves are closed, planar, inside the outline, and do not intersect with each other.", "Information");
+            }
+        }
+
+        // Überprüfen ob zwei Kurven sich überschneiden oder eine in der anderen liegt
+        private bool DoCurvesIntersect(Curve curve1, Curve curve2)
+        {
+            // Wenn die Kurven sich überschneiden
+            Rhino.Geometry.Intersect.CurveIntersections intersections = 
+                Rhino.Geometry.Intersect.Intersection.CurveCurve(curve1, curve2, 0.001, 0.001);
+
+            if (intersections != null && intersections.Count > 0)
+                return true;
+
+            // Überprüfen, ob der Schwerpunkt einer Kurve innerhalb der anderen liegt
+            AreaMassProperties amp1 = AreaMassProperties.Compute(curve1);
+            AreaMassProperties amp2 = AreaMassProperties.Compute(curve2);
+
+            if (amp1 != null && amp2 != null)
+            {
+                Point3d centroid1 = amp1.Centroid;
+                Point3d centroid2 = amp2.Centroid;
+
+                // Veraltete Contains-Methode durch Version mit Toleranz ersetzen
+                if (curve1.Contains(centroid2, Plane.WorldXY, 0.001) != PointContainment.Outside ||
+                    curve2.Contains(centroid1, Plane.WorldXY, 0.001) != PointContainment.Outside)
+                    return true;
+            }
+
+            return false;
         }
 
         private void ClearResults()
@@ -659,20 +798,187 @@ namespace Moments_of_Inertia.Views
             if (outlineCurve == null || curve == null)
                 return false;
 
-            // Prüfen, ob die Kurve innerhalb der Umrisskurve liegt
-            Plane plane;
-            if (!outlineCurve.TryGetPlane(out plane))
-                return false;
+            try
+            {
+                // Prüfen, ob die Kurve planar ist
+                Plane plane;
+                if (!outlineCurve.TryGetPlane(out plane))
+                    return false;
 
-            // Mittelpunkt der Kurve berechnen
-            AreaMassProperties amp = AreaMassProperties.Compute(curve);
-            if (amp == null)
-                return false;
+                // VERBESSERT: Einfache BoundingBox-Prüfung als schneller Ausschlusstest
+                BoundingBox curveBBox = curve.GetBoundingBox(true);
+                BoundingBox outlineBBox = outlineCurve.GetBoundingBox(true);
+                
+                // Mit etwas Toleranz für numerische Ungenauigkeiten
+                outlineBBox.Inflate(0.001); // Kleine Toleranz hinzufügen
 
-            Point3d centroid = amp.Centroid;
-            
-            // Prüfen, ob der Mittelpunkt innerhalb der Umrisskurve liegt
-            return outlineCurve.Contains(centroid, plane, 0.001) == PointContainment.Inside;
+                // Schneller Ausschlusstest: Wenn die Hohlraum-BoundingBox nicht innerhalb
+                // der erweiterten Outline-BoundingBox liegt, kann die Kurve nicht vollständig innerhalb liegen
+                if (!outlineBBox.Contains(curveBBox))
+                    return false;
+                
+                // Strategiewechsel: Prüfen ob Punkte auf/innerhalb Outline liegen
+                
+                // 1. Prüfen des Schwerpunkts (für einfache Fälle)
+                AreaMassProperties amp = AreaMassProperties.Compute(curve);
+                if (amp == null)
+                    return false;
+                    
+                Point3d centroid = amp.Centroid;
+                PointContainment centroidContainment = outlineCurve.Contains(centroid, plane, 0.001);
+                if (centroidContainment == PointContainment.Outside)
+                    return false;
+                
+                // 2. Unterschiedliche Strategien basierend auf Genauigkeitseinstellung
+                if (highAccuracyCheckBox.Checked.GetValueOrDefault())
+                {
+                    // A. Punktweise Prüfung mit hoher Punktdichte
+                    int pointCount = Math.Max(50, (int)(curve.GetLength() / 1.0)); // Viele Punkte für hohe Genauigkeit
+                    bool allPointsInside = true;
+                    
+                    for (int i = 0; i < pointCount; i++)
+                    {
+                        double t = i / (double)(pointCount - 1);
+                        Point3d point = curve.PointAt(t);
+                        PointContainment containment = outlineCurve.Contains(point, plane, 0.001);
+                        
+                        if (containment == PointContainment.Outside)
+                        {
+                            allPointsInside = false;
+                            break;
+                        }
+                    }
+                    
+                    if (!allPointsInside)
+                        return false;
+                    
+                    // B. Versuch mit Boolean-Operationen (nur als zusätzlicher Test)
+                    try
+                    {
+                        // Wenn die Kurve vollständig innerhalb liegt, sollte eine
+                        // Boolean-Differenz möglich sein und zu einer geschlossenen Kurve führen
+                        Curve[] diff = Curve.CreateBooleanDifference(outlineCurve, curve, 0.001);
+                        
+                        // Wenn keine Differenz erstellt werden konnte, ist etwas falsch
+                        if (diff == null || diff.Length == 0)
+                            return false;
+                        
+                        // Es muss mindestens eine geschlossene Kurve als Ergebnis geben
+                        bool hasClosedCurve = false;
+                        foreach (Curve c in diff)
+                        {
+                            if (c.IsClosed)
+                            {
+                                hasClosedCurve = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!hasClosedCurve)
+                            return false;
+                        
+                        // Berechnung der Flächendifferenz (sollte positiv sein)
+                        AreaMassProperties outlineAmp = AreaMassProperties.Compute(outlineCurve);
+                        AreaMassProperties curveAmp = AreaMassProperties.Compute(curve);
+                        
+                        if (outlineAmp != null && curveAmp != null)
+                        {
+                            // Die Differenz der Flächen sollte relevant sein
+                            double areaDiff = outlineAmp.Area - curveAmp.Area;
+                            if (areaDiff <= 0)
+                                return false;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // Bei Fehlern in der Boolean-Operation ignorieren und
+                        // Entscheidung auf Basis der Punkttests treffen
+                    }
+                }
+                else
+                {
+                    // Einfachere Prüfung für Performance-Modus: Einige Punkte auf der Kurve testen
+                    int pointCount = Math.Max(8, (int)(curve.GetLength() / 10.0)); // Weniger Punkte im Performance-Modus
+                    int outsidePoints = 0;
+                    
+                    for (int i = 0; i < pointCount; i++)
+                    {
+                        double t = i / (double)(pointCount - 1);
+                        Point3d point = curve.PointAt(t);
+                        if (outlineCurve.Contains(point, plane, 0.001) == PointContainment.Outside)
+                        {
+                            outsidePoints++;
+                        }
+                    }
+                    
+                    // Tolerieren von maximal einem Punkt, der als außerhalb erkannt wird (für numerische Stabilität)
+                    if (outsidePoints > 1)
+                        return false;
+                }
+                
+                // 3. Durchführen eines Region-Containment-Tests als letzte Überprüfung
+                // Dieser Test ist zuverlässiger als die Boolean-Operationen bei bestimmten Kurvenformen
+                try
+                {
+                    // Region aus der Hohlkurve erstellen
+                    Curve[] loops = new Curve[] { curve };
+                    // Die Methode CreatePlanarBreps statt CreatePlanarFace verwenden
+                    Brep[] faces = Brep.CreatePlanarBreps(loops, 0.001);
+                    
+                    if (faces != null && faces.Length > 0)
+                    {
+                        // Das erste Brep prüfen
+                        foreach (BrepFace face in faces[0].Faces)
+                        {
+                            // To3dCurve() korrekt verwenden - in ein Array konvertieren falls nötig
+                            var loopCurve = face.OuterLoop.To3dCurve();
+                            
+                            // Immer als einzelne Curve behandeln und in ein Array konvertieren
+                            Curve[] regionCurves = new Curve[] { loopCurve };
+                            
+                            if (regionCurves != null && regionCurves.Length > 0)
+                            {
+                                // Ist die Kurve der Region innerhalb der Outline?
+                                bool isValid = true;
+                                foreach (Curve regionCurve in regionCurves)
+                                {
+                                    int testPointCount = Math.Max(4, (int)(regionCurve.GetLength() / 20.0));
+                                    for (int i = 0; i < testPointCount; i++)
+                                    {
+                                        double t = i / (double)(testPointCount - 1);
+                                        Point3d point = regionCurve.PointAt(t);
+                                        
+                                        if (outlineCurve.Contains(point, plane, 0.001) == PointContainment.Outside)
+                                        {
+                                            isValid = false;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    if (!isValid)
+                                        break;
+                                }
+                                
+                                // Wenn die Region ungültig ist, ist die Kurve nicht innen
+                                if (!isValid)
+                                    return false;
+                            }
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    // Fehler ignorieren - andere Tests könnten trotzdem bestanden werden
+                }
+                
+                // Wenn alle Tests erfolgreich waren (oder keine Fehler geworfen haben),
+                // nehmen wir an, dass die Kurve vollständig innerhalb liegt
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         private void CalculateButton_Click(object sender, EventArgs e)
@@ -683,8 +989,81 @@ namespace Moments_of_Inertia.Views
                 return;
             }
 
+            // Ladeindikator anzeigen
+            string originalButtonText = calculateButton.Text;
+            calculateButton.Text = "Calculating...";
+            calculateButton.Enabled = false;
+            Application.Instance.RunIteration(); // Aktualisierung der UI erzwingen
+
             try
             {
+                // Validierung der Dichte, falls "Custom" ausgewählt ist
+                if (materialDropdown.SelectedKey == "Custom")
+                {
+                    if (!double.TryParse(densityTextBox.Text, out double customDensity) || customDensity <= 0)
+                    {
+                        MessageBox.Show("Please enter a positive density value", "Validation Error");
+                        calculateButton.Text = originalButtonText;
+                        calculateButton.Enabled = true;
+                        return;
+                    }
+                }
+
+                // Validierung der Profiltiefe
+                double profileDepth = 1000; // Default: 1000 mm = 1 m
+                if (!double.TryParse(profileDepthTextBox.Text, out profileDepth) || profileDepth <= 0)
+                {
+                    MessageBox.Show("Please enter a positive profile depth value in mm", "Validation Error");
+                    calculateButton.Text = originalButtonText;
+                    calculateButton.Enabled = true;
+                    return;
+                }
+                
+                // Obergrenze für sinnvolle Profiltiefe (10 m = 10000 mm)
+                if (profileDepth > 10000)
+                {
+                    MessageBox.Show("Profile depth exceeds 10 m (10000 mm). Values may be unrealistic.", "Warning");
+                }
+                
+                // Validierung der Biegemomente
+                double momentX = 0;
+                double momentY = 0;
+                double yieldStrength = 0;
+                double safetyFactor = 1.0;
+                
+                if (!double.TryParse(momentXTextBox.Text, out momentX))
+                {
+                    MessageBox.Show("Invalid value for moment Mx. Please enter a valid number.", "Validation Error");
+                    calculateButton.Text = originalButtonText;
+                    calculateButton.Enabled = true;
+                    return;
+                }
+                
+                if (!double.TryParse(momentYTextBox.Text, out momentY))
+                {
+                    MessageBox.Show("Invalid value for moment My. Please enter a valid number.", "Validation Error");
+                    calculateButton.Text = originalButtonText;
+                    calculateButton.Enabled = true;
+                    return;
+                }
+                
+                if (!double.TryParse(yieldStrengthTextBox.Text, out yieldStrength) || yieldStrength <= 0)
+                {
+                    MessageBox.Show("Please enter a positive yield strength value", "Validation Error");
+                    calculateButton.Text = originalButtonText;
+                    calculateButton.Enabled = true;
+                    return;
+                }
+                
+                safetyFactor = utilizationFactorStepper.Value;
+                if (safetyFactor <= 0)
+                {
+                    MessageBox.Show("Safety factor must be positive", "Validation Error");
+                    calculateButton.Text = originalButtonText;
+                    calculateButton.Enabled = true;
+                    return;
+                }
+
                 // Erstellen einer planaren Fläche aus der Umrisskurve
                 Curve[] boundaries = new Curve[hollowCurves.Count + 1];
                 boundaries[0] = outlineCurve;
@@ -697,7 +1076,9 @@ namespace Moments_of_Inertia.Views
                 Brep[] breps = Brep.CreatePlanarBreps(boundaries, 0.001);
                 if (breps == null || breps.Length == 0)
                 {
-                    MessageBox.Show("Failed to create planar surface", "Error");
+                    MessageBox.Show("Failed to create planar surface. Please check if hollow curves are fully inside outline and do not intersect each other.", "Error");
+                    calculateButton.Text = originalButtonText;
+                    calculateButton.Enabled = true;
                     return;
                 }
 
@@ -706,6 +1087,8 @@ namespace Moments_of_Inertia.Views
                 if (amp == null)
                 {
                     MessageBox.Show("Failed to compute area properties", "Error");
+                    calculateButton.Text = originalButtonText;
+                    calculateButton.Enabled = true;
                     return;
                 }
 
@@ -713,56 +1096,112 @@ namespace Moments_of_Inertia.Views
                 area = amp.Area;
                 centroid = amp.Centroid;
 
-                // Berechnung der Trägheitsmomente
-                // Wir verwenden die Brep-Geometrie für eine genauere Berechnung
-                Ix = 0;
-                Iy = 0;
-
-                // Wir teilen das Brep in Flächen auf
-                Mesh[] meshes = Mesh.CreateFromBrep(breps[0], MeshingParameters.Default);
-                if (meshes == null || meshes.Length == 0)
+                // Trägheitsmomente berechnen mit der direkten Rhino-Methode
+                // Nutze CentroidCoordinatesMomentsOfInertia für Momente bezogen auf den Schwerpunkt
+                Vector3d momentsOfInertia = amp.CentroidCoordinatesMomentsOfInertia;
+                
+                // Die Momente von Inertia in CentroidCoordinatesMomentsOfInertia sind:
+                // X = Ix (Moment um die X-Achse durch den Schwerpunkt)
+                // Y = Iy (Moment um die Y-Achse durch den Schwerpunkt)
+                // Z = Iz (Moment um die Z-Achse durch den Schwerpunkt)
+                Ix = momentsOfInertia.X;
+                Iy = momentsOfInertia.Y;
+                
+                // OPTIMIERT: Zweistufige Berechnung von xMax und yMax für bessere Performance
+                double yMax = 0.0;
+                double xMax = 0.0;
+                
+                // Stufe 1: Schnelle Abschätzung mit BoundingBox
+                BoundingBox bbox = outlineCurve.GetBoundingBox(true);
+                yMax = Math.Max(Math.Abs(bbox.Max.Y - centroid.Y), Math.Abs(bbox.Min.Y - centroid.Y));
+                xMax = Math.Max(Math.Abs(bbox.Max.X - centroid.X), Math.Abs(bbox.Min.X - centroid.X));
+                
+                // Stufe 2: Präzise Berechnung mit Punkten auf der Kurve, wenn hohe Genauigkeit gewünscht ist
+                if (highAccuracyCheckBox.Checked.GetValueOrDefault())
                 {
-                    MessageBox.Show("Failed to create mesh for calculations", "Error");
-                    return;
-                }
-
-                // Für jedes Mesh
-                foreach (Mesh mesh in meshes)
-                {
-                    // Für jedes Dreieck im Mesh
-                    for (int i = 0; i < mesh.Faces.Count; i++)
+                    // Prüfen der Randpunkte der Outline-Kurve
+                    int outlinePointCount = Math.Max(200, (int)(outlineCurve.GetLength() / 0.5)); // Hohe Dichte
+                    for (int i = 0; i < outlinePointCount; i++)
                     {
-                        MeshFace face = mesh.Faces[i];
-                        Point3d p1 = mesh.Vertices[face.A];
-                        Point3d p2 = mesh.Vertices[face.B];
-                        Point3d p3 = mesh.Vertices[face.C];
-
-                        // Fläche des Dreiecks
-                        double triangleArea = AreaOfTriangle(p1, p2, p3);
-
-                        // Schwerpunkt des Dreiecks
-                        Point3d triangleCentroid = new Point3d(
-                            (p1.X + p2.X + p3.X) / 3.0,
-                            (p1.Y + p2.Y + p3.Y) / 3.0,
-                            (p1.Z + p2.Z + p3.Z) / 3.0);
-
-                        // Beitrag zum Trägheitsmoment (bezogen auf den Gesamtschwerpunkt)
-                        double dx = triangleCentroid.X - centroid.X;
-                        double dy = triangleCentroid.Y - centroid.Y;
-
-                        // Steiner'scher Satz: I = I_cm + m*d²
-                        Ix += triangleArea * dy * dy;
-                        Iy += triangleArea * dx * dx;
+                        double t = i / (double)(outlinePointCount - 1);
+                        Point3d point = outlineCurve.PointAt(t);
+                        
+                        double dx = Math.Abs(point.X - centroid.X);
+                        double dy = Math.Abs(point.Y - centroid.Y);
+                        
+                        xMax = Math.Max(xMax, dx);
+                        yMax = Math.Max(yMax, dy);
+                    }
+                    
+                    // Auch Hohlraumkurven prüfen, falls vorhanden
+                    foreach (Curve hollowCurve in hollowCurves)
+                    {
+                        int hollowPointCount = Math.Max(100, (int)(hollowCurve.GetLength() / 0.5)); // Hohe Dichte
+                        for (int i = 0; i < hollowPointCount; i++)
+                        {
+                            double t = i / (double)(hollowPointCount - 1);
+                            Point3d point = hollowCurve.PointAt(t);
+                            
+                            double dx = Math.Abs(point.X - centroid.X);
+                            double dy = Math.Abs(point.Y - centroid.Y);
+                            
+                            xMax = Math.Max(xMax, dx);
+                            yMax = Math.Max(yMax, dy);
+                        }
                     }
                 }
-
-                // Widerstandsmomente berechnen
-                // Vereinfachte Berechnung: Wir nehmen an, dass die Kurve symmetrisch ist
-                BoundingBox bbox = outlineCurve.GetBoundingBox(true);
+                else
+                {
+                    // Nur bei komplexeren Profilen mit Hohlräumen zusätzlich einfache Stichproben nehmen
+                    if (hollowCurves.Count > 0)
+                    {
+                        // Outline mit geringer Punktdichte prüfen
+                        int outlinePointCount = Math.Max(50, (int)(outlineCurve.GetLength() / 2.0));
+                        for (int i = 0; i < outlinePointCount; i++)
+                        {
+                            double t = i / (double)(outlinePointCount - 1);
+                            Point3d point = outlineCurve.PointAt(t);
+                            
+                            double dx = Math.Abs(point.X - centroid.X);
+                            double dy = Math.Abs(point.Y - centroid.Y);
+                            
+                            xMax = Math.Max(xMax, dx);
+                            yMax = Math.Max(yMax, dy);
+                        }
+                        
+                        // Hohlräume mit geringer Punktdichte prüfen
+                        foreach (Curve hollowCurve in hollowCurves)
+                        {
+                            int hollowPointCount = Math.Max(20, (int)(hollowCurve.GetLength() / 3.0));
+                            for (int i = 0; i < hollowPointCount; i++)
+                            {
+                                double t = i / (double)(hollowPointCount - 1);
+                                Point3d point = hollowCurve.PointAt(t);
+                                
+                                double dx = Math.Abs(point.X - centroid.X);
+                                double dy = Math.Abs(point.Y - centroid.Y);
+                                
+                                xMax = Math.Max(xMax, dx);
+                                yMax = Math.Max(yMax, dy);
+                            }
+                        }
+                    }
+                }
                 
-                double yMax = Math.Max(Math.Abs(centroid.Y - bbox.Min.Y), Math.Abs(centroid.Y - bbox.Max.Y));
-                double xMax = Math.Max(Math.Abs(centroid.X - bbox.Min.X), Math.Abs(centroid.X - bbox.Max.X));
+                // VERBESSERT: Sicherheitscheck, dass die Abstände nicht Null sind
+                if (yMax < 0.001)
+                {
+                    MessageBox.Show("Maximum y-distance from centroid too small for accurate calculations", "Warning");
+                    yMax = 0.001;
+                }
                 
+                if (xMax < 0.001)
+                {
+                    MessageBox.Show("Maximum x-distance from centroid too small for accurate calculations", "Warning");
+                    xMax = 0.001;
+                }
+                
+                // Widerstandsmomente berechnen mit genaueren Maximalwerten
                 Wx = Ix / yMax;
                 Wy = Iy / xMax;
                 
@@ -771,21 +1210,90 @@ namespace Moments_of_Inertia.Views
                 iy = Math.Sqrt(Iy / area);
                 
                 // Masse berechnen (basierend auf Dichte)
-                double density = 0;
-                if (double.TryParse(densityTextBox.Text, out density))
+                double materialDensity = 0;
+                if (double.TryParse(densityTextBox.Text, out materialDensity))
                 {
-                    // Da das Dokument standardmäßig in mm ist und wir eine Profillänge von 1 Meter annehmen:
-                    // Dichte: g/cm³
-                    // Fläche: mm²
-                    // Profillänge: 1000 mm
+                    // VERBESSERT: Klare Dokumentation der Annahmen:
+                    // - Dichte in g/cm³
+                    // - Fläche in mm²
+                    // - Profiltiefe in mm (benutzerdefiniert)
+                    // - Berechnung: Masse [kg] = Fläche [mm²] * Tiefe [mm] * Dichte [g/cm³] / 10⁶
                     
                     // Umrechnung: g/cm³ -> g/mm³ (dividieren durch 1000)
-                    double densityInGPerMm3 = density / 1000.0;
+                    double densityInGPerMm3 = materialDensity / 1000.0;
                     
                     // Masse = Volumen * Dichte
-                    // Volumen = Fläche * Länge (1000 mm)
+                    // Volumen = Fläche * Tiefe
                     // Umrechnung in kg: dividieren durch 1000
-                    mass = area * 1000.0 * densityInGPerMm3 / 1000.0;
+                    mass = area * profileDepth * densityInGPerMm3 / 1000.0;
+                }
+                else
+                {
+                    // Wenn die Dichte nicht gültig ist, keine Masse berechnen
+                    mass = 0;
+                }
+                
+                // Zusätzlich: Berechnung der Ausnutzung, wenn Biegemomente eingegeben wurden
+                if ((momentX != 0) || (momentY != 0))
+                {
+                    if (yieldStrength > 0)
+                    {
+                        // Momente von kNm in Nmm umrechnen (x 10^6)
+                        momentX *= 1000000;
+                        momentY *= 1000000;
+                        
+                        // Spannungen berechnen (N/mm²)
+                        // Berücksichtigung der Richtung: Positive und negative Spannungen berücksichtigen
+                        double sigmaXPos = momentX > 0 ? momentX / Wx : 0;
+                        double sigmaXNeg = momentX < 0 ? -momentX / Wx : 0;
+                        double sigmaYPos = momentY > 0 ? momentY / Wy : 0;
+                        double sigmaYNeg = momentY < 0 ? -momentY / Wy : 0;
+                        
+                        // Maximale Spannung in jeder Richtung auswählen
+                        double sigmaX = Math.Max(Math.Abs(sigmaXPos), Math.Abs(sigmaXNeg));
+                        double sigmaY = Math.Max(Math.Abs(sigmaYPos), Math.Abs(sigmaYNeg));
+                        
+                        // Von Mises Vergleichsspannung berechnen
+                        // HINWEIS: Diese Formel berücksichtigt nur Biegespannungen, keine Schubspannungen
+                        // Für eine vollständigere Berechnung wäre σv = √(σx² + σy² - σx·σy + 3·τ²) nötig
+                        double sigmaV = Math.Sqrt(sigmaX * sigmaX + sigmaY * sigmaY - sigmaX * sigmaY);
+                        
+                        // Ausnutzung berechnen (unter Berücksichtigung des Sicherheitsfaktors)
+                        double utilization = sigmaV / (yieldStrength / safetyFactor) * 100;
+                        
+                        // Ergebnis anzeigen
+                        utilizationResultLabel.Text = $"{utilization:F1} %";
+                        utilizationResultLabel.TextColor = utilization > 100 ? Colors.Red : Colors.Black;
+                        
+                        // Auch in die Ergebnistabelle aufnehmen
+                        utilizationValues = new Dictionary<string, double>
+                        {
+                            { "Sigma X", sigmaX },
+                            { "Sigma Y", sigmaY },
+                            { "Sigma v", sigmaV },
+                            { "Utilization", utilization }
+                        };
+                        
+                        // Zusatz-Info zur Schubspannung
+                        MessageBox.Show(
+                            "Note: The utilization calculation considers only bending stresses (σx, σy).\n" +
+                            "Shear stresses are not included in this simplified model.\n" +
+                            "For a complete stress analysis, a FEA tool should be used.", 
+                            "Stress Calculation Info", 
+                            MessageBoxType.Information);
+                    }
+                    else
+                    {
+                        utilizationResultLabel.Text = "Invalid yield strength";
+                        utilizationResultLabel.TextColor = Colors.Red;
+                        utilizationValues = null;
+                    }
+                }
+                else
+                {
+                    utilizationResultLabel.Text = "-- %";
+                    utilizationResultLabel.TextColor = Colors.Black;
+                    utilizationValues = null;
                 }
                 
                 // Ergebnisse anzeigen
@@ -803,6 +1311,12 @@ namespace Moments_of_Inertia.Views
             catch (Exception ex)
             {
                 MessageBox.Show($"Error: {ex.Message}", "Calculation Error");
+            }
+            finally
+            {
+                // Ladeindikator entfernen und Button wiederherstellen
+                calculateButton.Text = originalButtonText;
+                calculateButton.Enabled = true;
             }
         }
 
@@ -826,13 +1340,27 @@ namespace Moments_of_Inertia.Views
                     return;
                 }
                 
+                // Warnung bei aktiviertem High-Accuracy-Modus
+                if (highAccuracyCheckBox.Checked.GetValueOrDefault())
+                {
+                    if (MessageBox.Show(
+                        "High accuracy mode is enabled, which may cause performance issues with real-time updates.\n\n" +
+                        "Do you want to continue with real-time updates in high accuracy mode?",
+                        "Performance Warning",
+                        MessageBoxButtons.YesNo) == DialogResult.No)
+                    {
+                        realtimeCheckBox.Checked = false;
+                        return;
+                    }
+                }
+                
                 // Event-Handler für Änderungen an Objekten hinzufügen
                 RhinoDoc.AddRhinoObject += Doc_AddRhinoObject;
                 RhinoDoc.DeleteRhinoObject += Doc_DeleteRhinoObject;
                 
                 // Timer für regelmäßige Überprüfung starten
                 _updateTimer = new UITimer();
-                _updateTimer.Interval = 1.0; // 1 Sekunde
+                _updateTimer.Interval = highAccuracyCheckBox.Checked.GetValueOrDefault() ? 2.0 : 1.0; // Längeres Intervall bei hoher Genauigkeit
                 _updateTimer.Elapsed += Timer_Elapsed;
                 _updateTimer.Start();
                 
@@ -860,16 +1388,14 @@ namespace Moments_of_Inertia.Views
             }
         }
         
-        // Separater Event-Handler für den Timer, der Exceptions fängt
-        private void Timer_Elapsed(object sender, EventArgs e)
+        // Optimierter Timer_Elapsed mit asynchroner Berechnung
+        private async void Timer_Elapsed(object sender, EventArgs e)
         {
             try
             {
-                // Prüfen, ob das Dokument noch gültig ist
                 RhinoDoc doc = RhinoDoc.ActiveDoc;
                 if (doc == null)
                 {
-                    // Wenn das Dokument nicht mehr existiert, Timer deaktivieren
                     if (_updateTimer != null)
                     {
                         _updateTimer.Stop();
@@ -877,35 +1403,66 @@ namespace Moments_of_Inertia.Views
                     }
                 }
                 
-                // Nur prüfen und aktualisieren, wenn nötig und alles gültig ist
-                if (HasCurveChanged())
+                bool hasChanged = HasCurveChanged();
+                
+                if (hasChanged)
                 {
-                    UpdateCurveInfo();
-                    
-                    // Nur berechnen, wenn noch eine Outline existiert
                     if (outlineCurve != null)
                     {
-                        CalculateButton_Click(this, EventArgs.Empty);
+                        // Alle Berechnungen und UI-Updates in einem asynchronen Task
+                        await Task.Run(() => {
+                            try
+                            {
+                                // UI-Updates im UI-Thread
+                                Eto.Forms.Application.Instance.Invoke(() => {
+                                    calculateButton.Text = "Calculating...";
+                                    calculateButton.Enabled = false;
+                                });
+                                
+                                // UpdateCurveInfo jetzt auch asynchron ausführen
+                                Eto.Forms.Application.Instance.Invoke(() => {
+                                    UpdateCurveInfo();
+                                });
+                                
+                                // Berechnung durchführen
+                                Eto.Forms.Application.Instance.Invoke(() => {
+                                    CalculateButton_Click(this, EventArgs.Empty);
+                                });
+                            }
+                            catch (Exception ex)
+                            {
+                                System.Diagnostics.Debug.WriteLine($"Async calculation error: {ex.Message}");
+                                
+                                // Fehlerfall: Button Zustand zurücksetzen
+                                Eto.Forms.Application.Instance.Invoke(() => {
+                                    calculateButton.Text = "Calculate";
+                                    calculateButton.Enabled = true;
+                                });
+                            }
+                        });
                     }
                     else
                     {
-                        // Wenn keine Outline mehr vorhanden ist, Echtzeit-Update deaktivieren
-                        realtimeCheckBox.Checked = false;
+                        Eto.Forms.Application.Instance.Invoke(() => {
+                            realtimeCheckBox.Checked = false;
+                        });
                     }
                 }
             }
             catch (Exception ex)
             {
-                // Fehler protokollieren oder anzeigen, je nach Anforderung
                 System.Diagnostics.Debug.WriteLine($"Timer error: {ex.Message}");
                 
-                // Bei schwerwiegenden Fehlern Timer deaktivieren
                 try
                 {
                     if (_updateTimer != null)
                     {
                         _updateTimer.Stop();
-                        realtimeCheckBox.Checked = false;
+                        Eto.Forms.Application.Instance.Invoke(() => {
+                            realtimeCheckBox.Checked = false;
+                            calculateButton.Text = "Calculate";
+                            calculateButton.Enabled = true;
+                        });
                     }
                 }
                 catch { /* Ignorieren */ }
@@ -1052,7 +1609,13 @@ namespace Moments_of_Inertia.Views
         private void DisplayResults()
         {
             string unit = unitDropdown.SelectedKey;
-            double factor = unit == "mm" ? 1.0 : 0.1; // mm zu cm Umrechnung
+            double factor = 1.0;
+            
+            // Umrechnungsfaktor für die gewählte Einheit
+            if (unit == "cm") 
+                factor = 0.1;  // mm zu cm
+            else if (unit == "m")
+                factor = 0.001; // mm zu m
             
             var results = new List<ResultItem>
             {
@@ -1077,13 +1640,46 @@ namespace Moments_of_Inertia.Views
             // Masse hinzufügen, wenn berechnet
             if (mass > 0)
             {
-                results.Add(new ResultItem("Mass", mass.ToString("F2"), "kg/m"));
+                double profileDepth = 1000;
+                double.TryParse(profileDepthTextBox.Text, out profileDepth);
+                
+                // Angepasst für benutzerdefinierte Tiefe
+                string massUnit = "kg";
+                string depthInfo = "";
+                
+                if (profileDepth == 1000)
+                {
+                    massUnit = "kg/m";
+                    depthInfo = "for 1m length";
+                }
+                else
+                {
+                    depthInfo = $"for {profileDepth}mm depth";
+                }
+                
+                results.Add(new ResultItem($"Mass ({depthInfo})", mass.ToString("F2"), massUnit));
                 
                 // Massenträgheitsmomente hinzufügen
                 double massIx = Ix * mass / area;
                 double massIy = Iy * mass / area;
-                results.Add(new ResultItem("Mass Moment of Inertia Ix", (massIx * Math.Pow(factor, 2)).ToString("F2"), "kg·" + unit + "²/m"));
-                results.Add(new ResultItem("Mass Moment of Inertia Iy", (massIy * Math.Pow(factor, 2)).ToString("F2"), "kg·" + unit + "²/m"));
+                results.Add(new ResultItem("Mass Moment of Inertia Ix", (massIx * Math.Pow(factor, 2)).ToString("F2"), "kg·" + unit + "²"));
+                results.Add(new ResultItem("Mass Moment of Inertia Iy", (massIy * Math.Pow(factor, 2)).ToString("F2"), "kg·" + unit + "²"));
+            }
+            
+            // Ausnutzungswerte hinzufügen, wenn vorhanden
+            if (utilizationValues != null)
+            {
+                results.Add(new ResultItem("", "", ""));  // Leerzeile als Trenner
+                results.Add(new ResultItem("Section Utilization", "", ""));
+                results.Add(new ResultItem("Stress Sigma X", utilizationValues["Sigma X"].ToString("F2"), "N/mm²"));
+                results.Add(new ResultItem("Stress Sigma Y", utilizationValues["Sigma Y"].ToString("F2"), "N/mm²"));
+                results.Add(new ResultItem("Equivalent Stress Sigma v", utilizationValues["Sigma v"].ToString("F2"), "N/mm²"));
+                
+                string utilizationText = utilizationValues["Utilization"].ToString("F1");
+                if (utilizationValues["Utilization"] > 100)
+                    utilizationText += " (!)";
+                    
+                results.Add(new ResultItem("Utilization", utilizationText, "%"));
             }
             
             resultsGridView.DataStore = results;
@@ -1123,13 +1719,13 @@ namespace Moments_of_Inertia.Views
 
         private double AreaOfTriangle(Point3d p1, Point3d p2, Point3d p3)
         {
-            // Berechnung der Fläche eines Dreiecks mit der Heron-Formel
-            double a = p1.DistanceTo(p2);
-            double b = p2.DistanceTo(p3);
-            double c = p3.DistanceTo(p1);
+            // Berechnung der Fläche mit Kreuzprodukt
+            Vector3d v1 = new Vector3d(p2 - p1);
+            Vector3d v2 = new Vector3d(p3 - p1);
+            Vector3d cross = Vector3d.CrossProduct(v1, v2);
             
-            double s = (a + b + c) / 2.0;
-            return Math.Sqrt(s * (s - a) * (s - b) * (s - c));
+            // Hälfte der Länge des Kreuzprodukts ist die Fläche
+            return 0.5 * cross.Length;
         }
 
         private void ChangeColorsButton_Click(object sender, EventArgs e)
@@ -1239,7 +1835,7 @@ namespace Moments_of_Inertia.Views
             
             // Einheiten holen
             string unit = unitDropdown.SelectedKey;
-            double factor = unit == "mm" ? 1.0 : 0.1; // mm zu cm Umrechnung
+            double factor = unit == "mm" ? 1.0 : (unit == "cm" ? 0.1 : 0.001); // Korrigiert für m-Einheit
             
             // Position für das TextElement berechnen
             // Wir platzieren es rechts neben dem Profil
@@ -1267,7 +1863,40 @@ namespace Moments_of_Inertia.Views
             
             if (mass > 0)
             {
-                sb.AppendLine($"Mass: {mass:F2} kg/m");
+                double profileDepth = 1000;
+                double.TryParse(profileDepthTextBox.Text, out profileDepth);
+                
+                // Angepasst für benutzerdefinierte Tiefe
+                string massUnit = "kg";
+                string depthInfo = "";
+                
+                if (profileDepth == 1000)
+                {
+                    massUnit = "kg/m";
+                    depthInfo = "for 1m profile length";
+                }
+                else
+                {
+                    depthInfo = $"for {profileDepth}mm profile depth";
+                }
+                
+                sb.AppendLine($"Mass: {mass:F2} {massUnit} ({depthInfo})");
+            }
+            
+            // Auch Ausnutzungswerte im Textblock anzeigen, wenn vorhanden
+            if (utilizationValues != null)
+            {
+                sb.AppendLine("");
+                sb.AppendLine("=== SECTION UTILIZATION ===");
+                sb.AppendLine($"Stress Sigma X: {utilizationValues["Sigma X"]:F2} N/mm²");
+                sb.AppendLine($"Stress Sigma Y: {utilizationValues["Sigma Y"]:F2} N/mm²");
+                sb.AppendLine($"Equivalent Stress: {utilizationValues["Sigma v"]:F2} N/mm²");
+                
+                string utilizationText = utilizationValues["Utilization"].ToString("F1");
+                if (utilizationValues["Utilization"] > 100)
+                    utilizationText += " (EXCEEDED)";
+                    
+                sb.AppendLine($"Utilization: {utilizationText} %");
             }
             
             // TextElement in Rhino erstellen
